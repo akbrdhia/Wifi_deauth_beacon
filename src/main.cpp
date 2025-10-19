@@ -220,8 +220,13 @@ void startBeaconSpam() {
 }
 
 void sendBeaconSpam() {
-  // Generate random SSID
-  String fakeSSID = "FakeAP-" + String(random(1000, 9999));
+  // Use target SSID if selected, otherwise generate random SSID
+  String fakeSSID;
+  if (targetSSID.length() > 0) {
+    fakeSSID = targetSSID;
+  } else {
+    fakeSSID = "FakeAP-" + String(random(1000, 9999));
+  }
   
   // Random MAC
   for (int i = 10; i < 16; i++) {
@@ -232,7 +237,11 @@ void sendBeaconSpam() {
   uint8_t packet[128];
   memcpy(packet, beaconPacket, 37);
   
+  // SSID length must not exceed 32 bytes for 802.11
   int ssidLen = fakeSSID.length();
+  if (ssidLen > 32) {
+    ssidLen = 32;
+  }
   packet[37] = ssidLen; // SSID length
   memcpy(&packet[38], fakeSSID.c_str(), ssidLen);
   
