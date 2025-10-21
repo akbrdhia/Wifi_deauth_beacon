@@ -2,17 +2,10 @@
 #define WIFI_ATTACKER_H
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include "esp_wifi.h"
-#include "esp_system.h"
 #include <vector>
-
-struct ClientDevice {
-    uint8_t mac[6];
-    int8_t rssi;
-    uint32_t lastSeen;
-    uint16_t packets;
-};
+#include "WiFiAttacker/models/ClientDevice.h"
+#include "WiFiAttacker/network/NetworkManager.h"
+#include "WiFiAttacker/utils/PacketUtils.h"
 
 class WiFiAttacker {
 public:
